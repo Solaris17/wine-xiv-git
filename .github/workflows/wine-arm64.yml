@@ -1,0 +1,272 @@
+name: Wine ARM64 CI
+
+on:
+  workflow_dispatch:
+
+env:
+  TKG_PIN: af63244f1896472c20629c973b97c3d68dd29b4a
+  FEX_PIN: e869aa644a16e4332cdc15c1ea0b4d13d482385d
+  LLVM_VERSION: "20250920"
+  LLVM_SHA256: bce5cc755c613515fd44e1ee9523123d854103abae147571adb645450036274d
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilation
+        run: |
+          set -o pipefail
+
+          sudo apt update
+
+          git init -q arm64-tkg
+          git -C arm64-tkg remote add origin https://github.com/Frogging-Family/wine-tkg-git.git
+          git -C arm64-tkg fetch --depth=1 origin "$TKG_PIN"
+          git -C arm64-tkg checkout -q --detach FETCH_HEAD
+          test "$(git -C arm64-tkg rev-parse HEAD)" = "$TKG_PIN"
+
+          source arm64-tkg/wine-tkg-git/wine-tkg-scripts/deps
+          filtered=()
+
+          for pkg in "${ubuntu_pkgs_64[@]}"; do
+            case "$pkg" in
+              gcc-multilib|g++-multilib|libavcodec58|libswresample3|libavutil56)
+                echo "Skipping $pkg"
+                ;;
+              *)
+                filtered+=("$pkg")
+                ;;
+            esac
+          done
+
+          sudo apt-get install -y "${filtered[@]}"
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          LLVM_ARCHIVE="llvm-mingw-${LLVM_VERSION}-ucrt-ubuntu-22.04-aarch64.tar.xz"
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/$LLVM_ARCHIVE" \
+            "https://github.com/bylaws/llvm-mingw/releases/download/${LLVM_VERSION}/${LLVM_ARCHIVE}"
+
+          echo "$LLVM_SHA256  $RUNNER_TEMP/$LLVM_ARCHIVE" | sha256sum -c -
+
+          mkdir -p "$RUNNER_TEMP/llvm-mingw"
+          tar \
+            -C "$RUNNER_TEMP/llvm-mingw" \
+            --strip-components=1 \
+            -xJf "$RUNNER_TEMP/$LLVM_ARCHIVE"
+          rm "$RUNNER_TEMP/$LLVM_ARCHIVE"
+
+          export PATH="$RUNNER_TEMP/llvm-mingw/bin:$PATH"
+
+          cp \
+            wine-tkg-git/wine-tkg-scripts/build-arm64.sh \
+            arm64-tkg/wine-tkg-git/wine-tkg-scripts/build-arm64.sh
+
+          chmod +x \
+            arm64-tkg/wine-tkg-git/wine-tkg-scripts/build-arm64.sh
+
+          cp \
+            wine-tkg-git/wine-tkg-profiles/arm64.cfg \
+            arm64-tkg/wine-tkg-git/wine-tkg-userpatches/user.cfg
+
+          cp \
+            wine-tkg-git/wine-tkg-patches/arm64ec/arm64ec-cpuid-guard.patch \
+            arm64-tkg/wine-tkg-git/wine-tkg-userpatches/arm64ec-cpuid-guard.mypatch
+
+          cp \
+            wine-tkg-git/wine-tkg-patches/arm64ec/arm64ec-msvcrt-string-guards.patch \
+            arm64-tkg/wine-tkg-git/wine-tkg-userpatches/arm64ec-msvcrt-string-guards.mypatch
+
+          cd arm64-tkg/wine-tkg-git
+          ./non-makepkg-build.sh \
+            --config "$PWD/wine-tkg-userpatches/user.cfg"
+
+          mapfile -t packages < <(
+            find "$PWD/non-makepkg-builds" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              -name 'wine-tkg-staging-git-*' \
+              -print
+          )
+
+          test "${#packages[@]}" -eq 1
+
+          PKG="${packages[0]}"
+          PACKAGE_NAME="${PKG##*/}"
+          VERSION="${PACKAGE_NAME#wine-tkg-staging-git-}"
+
+          test "$VERSION" != "$PACKAGE_NAME"
+
+          RELEASE="wine-xiv-arm64ec-staging-${VERSION}-r1"
+
+          echo "Wine package: $PACKAGE_NAME"
+          echo "Release: $RELEASE"
+
+          test -d "$PKG"
+
+          ARM_UNIX="$PKG/lib64/wine/aarch64-unix"
+          test -d "$ARM_UNIX"
+          test -e "$ARM_UNIX/wine-preloader"
+
+          (
+            cd "$ARM_UNIX"
+            ln -sfn wine wine64
+            ln -sfn wine-preloader wine64-preloader
+          )
+
+          test -L "$PKG/bin/wine64"
+          test "$(readlink "$PKG/bin/wine64")" = "wine"
+          test -L "$ARM_UNIX/wine64"
+          test "$(readlink "$ARM_UNIX/wine64")" = "wine"
+          test -L "$ARM_UNIX/wine64-preloader"
+          test "$(readlink "$ARM_UNIX/wine64-preloader")" = "wine-preloader"
+
+          "$PKG/bin/wine" --version
+          file "$PKG/bin/wine"
+          file "$PKG/lib64/wine/aarch64-windows/ntdll.dll"
+
+          mkdir -p "$RUNNER_TEMP/runtime"
+          mv "$PKG" "$RUNNER_TEMP/runtime/$RELEASE"
+
+          cd "$GITHUB_WORKSPACE"
+          rm -rf arm64-tkg /tmp/wine-tkg
+          df -h /
+
+          git clone \
+            -q \
+            --filter=blob:none \
+            https://github.com/FEX-Emu/FEX.git \
+            arm64-fex
+
+          git -C arm64-fex checkout \
+            -q \
+            --detach \
+            "$FEX_PIN"
+
+          git -C arm64-fex submodule update \
+            --init \
+            --recursive \
+            --depth 1
+
+          test "$(git -C arm64-fex rev-parse HEAD)" = "$FEX_PIN"
+
+          cd arm64-fex
+
+          CXXFLAGS="-Wno-deprecated-enum-enum-conversion" \
+          cmake \
+            -S . \
+            -B build-arm64ec \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_INSTALL_LIBDIR=/ \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_mingw.cmake" \
+            -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
+            -DRANGES_NATIVE=OFF \
+            -DENABLE_LTO=False \
+            -DBUILD_TESTING=False \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+            -DENABLE_ASSERTIONS=False \
+            -DTUNE_CPU=generic \
+            -DTUNE_ARCH=generic \
+            -DOVERRIDE_VERSION=2608
+
+          ninja -C build-arm64ec -j4
+
+          RUNTIME="$RUNNER_TEMP/runtime/$RELEASE"
+
+          mkdir -p "$RUNTIME/share/xivlauncher-arm64"
+
+          cp \
+            build-arm64ec/Bin/libarm64ecfex.dll \
+            "$RUNTIME/share/xivlauncher-arm64/libarm64ecfex.dll"
+
+          file "$RUNTIME/share/xivlauncher-arm64/libarm64ecfex.dll"
+
+          cd "$GITHUB_WORKSPACE"
+          rm -rf arm64-fex
+          df -h /
+
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+
+          export WINEPREFIX="$RUNNER_TEMP/wineprefix"
+          export WINEDEBUG="-all"
+
+          "$RUNTIME/bin/wine" wineboot -u
+          "$RUNTIME/bin/wineserver" -w
+          "$RUNTIME/bin/wine" cmd /c ver
+
+          mkdir -p "$WINEPREFIX/drive_c/windows/system32"
+
+          cp \
+            "$RUNTIME/share/xivlauncher-arm64/libarm64ecfex.dll" \
+            "$WINEPREFIX/drive_c/windows/system32/libarm64ecfex.dll"
+
+          "$RUNTIME/bin/wine" reg add \
+            'HKLM\Software\Microsoft\Wow64\amd64' \
+            /ve \
+            /d libarm64ecfex.dll \
+            /f
+
+          "$RUNTIME/bin/wineserver" -w
+
+          printf '%s\n' \
+            '#include <stdio.h>' \
+            'int main(void) { puts("FEX_AMD64_OK"); return 0; }' \
+            > "$RUNNER_TEMP/fex-amd64-probe.c"
+
+          x86_64-w64-mingw32-clang \
+            -O2 \
+            -o "$RUNNER_TEMP/fex-amd64-probe.exe" \
+            "$RUNNER_TEMP/fex-amd64-probe.c"
+
+          set +e
+          WINEDEBUG=+loaddll \
+            "$RUNTIME/bin/wine" \
+            "$RUNNER_TEMP/fex-amd64-probe.exe" \
+            > "$RUNNER_TEMP/fex-probe.log" 2>&1
+          PROBE_RC=$?
+          set -e
+
+          test "$PROBE_RC" -eq 0
+          grep -q 'FEX_AMD64_OK' "$RUNNER_TEMP/fex-probe.log"
+          grep -qi 'libarm64ecfex.dll' "$RUNNER_TEMP/fex-probe.log"
+
+          "$RUNTIME/bin/wineserver" -w
+
+          rm -rf "$WINEPREFIX"
+
+          mkdir -p "$GITHUB_WORKSPACE/release"
+
+          tar \
+            --sort=name \
+            --mtime='@0' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "$RUNNER_TEMP/runtime" \
+            -cJf "$GITHUB_WORKSPACE/release/$RELEASE.tar.xz" \
+            "$RELEASE"
+
+          (
+            cd "$GITHUB_WORKSPACE/release"
+            sha256sum "$RELEASE.tar.xz" > "$RELEASE.tar.xz.sha256"
+            sha512sum "$RELEASE.tar.xz" > "$RELEASE.tar.xz.sha512"
+          )
+
+          cat "$GITHUB_WORKSPACE/release/$RELEASE.tar.xz.sha256"
+          cat "$GITHUB_WORKSPACE/release/$RELEASE.tar.xz.sha512"
+          ls -lh "$GITHUB_WORKSPACE/release"
+          df -h /
+
+      - name: Archive the artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wine-xiv-ubuntu-arm64
+          path: release
